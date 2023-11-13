@@ -14,6 +14,11 @@
 #include <cuda.h>
 #include <string.h>
 #include "common/pgm.h"
+#include <cmath>
+#include <jpeglib.h>
+#include <png.h>
+#include <iostream>
+#include <setjmp.h>
 
 const int degreeInc = 2;
 const int degreeBins = 180 / degreeInc;
@@ -53,8 +58,8 @@ void CPU_HoughTran (unsigned char *pic, int w, int h, int **acc)
 //*****************************************************************
 // TODO usar memoria constante para la tabla de senos y cosenos
 // inicializarlo en main y pasarlo al device
-//__constant__ float d_Cos[degreeBins];
-//__constant__ float d_Sin[degreeBins];
+__constant__ float d_Cos[degreeBins];
+__constant__ float d_Sin[degreeBins];
 
 //*****************************************************************
 //TODO Kernel memoria compartida
@@ -70,7 +75,7 @@ void CPU_HoughTran (unsigned char *pic, int w, int h, int **acc)
 
 // GPU kernel. One thread per image pixel is spawned.
 // The accummulator memory needs to be allocated by the host in global memory
-__global__ void GPU_HoughTran (unsigned char *pic, int w, int h, int *acc, float rMax, float rScale, float *d_Cos, float *d_Sin)
+__global__ void GPU_HoughTran (unsigned char *pic, int w, int h, int *acc, float rMax, float rScale)
 {
   //TODO calcular: int gloID = ?
   int gloID = blockIdx.x * blockDim.x + threadIdx.x;
@@ -82,7 +87,6 @@ __global__ void GPU_HoughTran (unsigned char *pic, int w, int h, int *acc, float
   //TODO explicar bien bien esta parte. Dibujar un rectangulo a modo de imagen sirve para visualizarlo mejor
   int xCoord = gloID % w - xCent;
   int yCoord = yCent - gloID / w;
-
   //TODO eventualmente usar memoria compartida para el acumulador
 
   if (pic[gloID] > 0)
@@ -105,112 +109,162 @@ __global__ void GPU_HoughTran (unsigned char *pic, int w, int h, int *acc, float
 }
 
 //*****************************************************************
-int main (int argc, char **argv)
-{
-  int i;
 
-  PGMImage inImg (argv[1]);
+void drawLine(unsigned char *img, int w, int h, int x0, int y0, int x1, int y1, unsigned char color) {
+    int dx = abs(x1 - x0), sx = x0 < x1 ? 1 : -1;
+    int dy = -abs(y1 - y0), sy = y0 < y1 ? 1 : -1;
+    int err = dx + dy, e2; /* error value e_xy */
 
-  int *cpuht;
-  int w = inImg.x_dim;
-  int h = inImg.y_dim;
+    while (true) {
+        if (x0 >= 0 && x0 < w && y0 >= 0 && y0 < h) {
+            img[y0 * w + x0] = color; // Establecer el color del píxel
+        }
+        if (x0 == x1 && y0 == y1) break;
+        e2 = 2 * err;
+        if (e2 >= dy) { err += dy; x0 += sx; } /* e_xy+e_x > 0 */
+        if (e2 <= dx) { err += dx; y0 += sy; } /* e_xy+e_y < 0 */
+    }
+}
 
-  float* d_Cos;
-  float* d_Sin;
+void drawLines(unsigned char *img, int w, int h, int *acc, int threshold) {
+    for (int tIdx = 0; tIdx < degreeBins; tIdx++) {
+        float theta = tIdx * radInc;
+        for (int rIdx = 0; rIdx < rBins; rIdx++) {
+            int idx = rIdx * degreeBins + tIdx;
+            if (acc[idx] > threshold) {
+                // Convertir (r, theta) a una línea (x0, y0, x1, y1)
+                float r = (rIdx - rBins / 2) * (2 * sqrt(w * w + h * h) / rBins);
+                int x0, y0, x1, y1;
 
-  cudaEvent_t start, stop;
-  cudaEventCreate(&start);
-  cudaEventCreate(&stop);
+                if (theta < M_PI / 4 || theta > 3 * M_PI / 4) { // aproximadamente vertical
+                    x0 = x1 = r / cos(theta);
+                    y0 = 0;
+                    y1 = h;
+                } else { // aproximadamente horizontal
+                    y0 = y1 = r / sin(theta);
+                    x0 = 0;
+                    x1 = w;
+                }
 
-  // CPU calculation
-  CPU_HoughTran(inImg.pixels, w, h, &cpuht);
+                // Ajustar para el centro de la imagen
+                x0 += w / 2;
+                y0 += h / 2;
+                x1 += w / 2;
+                y1 += h / 2;
 
-  cudaMalloc ((void **) &d_Cos, sizeof (float) * degreeBins);
-  cudaMalloc ((void **) &d_Sin, sizeof (float) * degreeBins);
+                // Dibujar la línea en la imagen
+                drawLine(img, w, h, x0, y0, x1, y1, 255); // Aquí 255 es el color (blanco para imágenes en escala de grises)
+            }
+        }
+    }
+}
+int main(int argc, char **argv) {
+    int i;
+    PGMImage inImg(argv[1]);
+    int w = inImg.x_dim;
+    int h = inImg.y_dim;
+    int *cpuht;
 
-  // CPU calculation
-  CPU_HoughTran(inImg.pixels, w, h, &cpuht);
+    cudaEvent_t start, stop;
+    cudaEventCreate(&start);
+    cudaEventCreate(&stop);
 
-  // pre-compute values to be stored
-  float *pcCos = (float *) malloc (sizeof (float) * degreeBins);
-  float *pcSin = (float *) malloc (sizeof (float) * degreeBins);
-  float rad = 0;
-  for (i = 0; i < degreeBins; i++)
-  {
-    pcCos[i] = cos (rad);
-    pcSin[i] = sin (rad);
-    rad += radInc;
-  }
+    // Cálculo en la CPU
+    CPU_HoughTran(inImg.pixels, w, h, &cpuht);
 
-  float rMax = sqrt (1.0 * w * w + 1.0 * h * h) / 2;
-  float rScale = 2 * rMax / rBins;
+    float pcCos[degreeBins], pcSin[degreeBins];
+    float rad = 0;
+    for (int i = 0; i < degreeBins; i++) {
+        pcCos[i] = cos(rad);
+        pcSin[i] = sin(rad);
+        rad += radInc;
+    }
 
-  // TODO eventualmente volver memoria global
-  cudaMemcpy(d_Cos, pcCos, sizeof (float) * degreeBins, cudaMemcpyHostToDevice);
-  cudaMemcpy(d_Sin, pcSin, sizeof (float) * degreeBins, cudaMemcpyHostToDevice);
+    float rMax = sqrt (1.0 * w * w + 1.0 * h * h) / 2;
+    float rScale = 2 * rMax / rBins;
 
-  // setup and copy data from host to device
-  unsigned char *d_in, *h_in;
-  int *d_hough, *h_hough;
+    cudaMemcpyToSymbol(d_Cos, pcCos, sizeof(float) * degreeBins);
+    cudaMemcpyToSymbol(d_Sin, pcSin, sizeof(float) * degreeBins);
 
-  h_in = inImg.pixels; // h_in contiene los pixeles de la imagen
+    // Configuración y ejecución del kernel
+    unsigned char *d_in;
+    int *d_hough;
+    cudaMalloc((void **)&d_in, sizeof(unsigned char) * w * h);
+    cudaMalloc((void **)&d_hough, sizeof(int) * degreeBins * rBins);
+    cudaMemcpy(d_in, inImg.pixels, sizeof(unsigned char) * w * h, cudaMemcpyHostToDevice);
+    cudaMemset(d_hough, 0, sizeof(int) * degreeBins * rBins);
 
-  h_hough = (int *) malloc (degreeBins * rBins * sizeof (int));
+    int blockNum = ceil((w * h) / 256.0);
+    cudaEventRecord(start);
+    GPU_HoughTran<<<blockNum, 256>>>(d_in, w, h, d_hough, rMax, rScale);
 
-  cudaMalloc ((void **) &d_in, sizeof (unsigned char) * w * h);
-  cudaMalloc ((void **) &d_hough, sizeof (int) * degreeBins * rBins);
-  cudaMemcpy (d_in, h_in, sizeof (unsigned char) * w * h, cudaMemcpyHostToDevice);
-  cudaMemset (d_hough, 0, sizeof (int) * degreeBins * rBins);
+    // Registro del final del evento
+    cudaEventRecord(stop);
 
+    // Esperar a que termine el kernel
+    cudaEventSynchronize(stop);
+
+    // Calculo del tiempo transcurrido
+    float milliseconds = 0;
+    cudaEventElapsedTime(&milliseconds, start, stop);
+    printf("Tiempo de ejecución del kernel: %f ms\n", milliseconds);
+
+    // Destrucción de eventos CUDA
+    cudaEventDestroy(start);
+    cudaEventDestroy(stop);
+
+    // Copiar resultados de vuelta al host y limpiar
+    int *h_hough = (int *)malloc(sizeof(int) * degreeBins * rBins);
+    cudaMemcpy(h_hough, d_hough, sizeof(int) * degreeBins * rBins, cudaMemcpyDeviceToHost);
     
-  // execution configuration uses a 1-D grid of 1-D blocks, each made of 256 threads
-  //1 thread por pixel
-  int blockNum = ceil (w * h / 256);
+    // compare CPU and GPU results
+    for (i = 0; i < degreeBins * rBins; i++)
+    {
+      if (cpuht[i] != h_hough[i])
+        printf ("Calculation mismatch at : %i %i %i\n", i, cpuht[i], h_hough[i]);
+    }
 
-  // Registro del inicio del evento
-  cudaEventRecord(start);
+   
 
-  GPU_HoughTran <<< blockNum, 256 >>> (d_in, w, h, d_hough, rMax, rScale, d_Cos, d_Sin);
+    // Dibujar las líneas en la imagen
+    int threshold = 50; // Ajusta este valor según sea necesario
+    drawLines(inImg.pixels, w, h, h_hough, threshold);
 
-  // Registro del final del evento
-  cudaEventRecord(stop);
+    // Guardar la imagen resultante en formato JPEG
+    FILE *outfile = fopen("output.jpg", "wb");
+    if (!outfile) {
+        std::cerr << "No se pudo abrir output.jpg para escritura" << std::endl;
+        return -1;
+    }
 
-  // Esperar a que termine el kernel
-  cudaEventSynchronize(stop);
+    struct jpeg_compress_struct cinfo;
+    struct jpeg_error_mgr jerr;
+    cinfo.err = jpeg_std_error(&jerr);
+    jpeg_create_compress(&cinfo);
+    jpeg_stdio_dest(&cinfo, outfile);
 
-  // Calculo del tiempo transcurrido
-  float milliseconds = 0;
-  cudaEventElapsedTime(&milliseconds, start, stop);
-  printf("Tiempo de ejecución del kernel: %f ms\n", milliseconds);
+    cinfo.image_width = w;
+    cinfo.image_height = h;
+    cinfo.input_components = 1;
+    cinfo.in_color_space = JCS_GRAYSCALE;
 
-  // Destrucción de eventos CUDA
-  cudaEventDestroy(start);
-  cudaEventDestroy(stop);
-  
-  // get results from device
-  cudaMemcpy (h_hough, d_hough, sizeof (int) * degreeBins * rBins, cudaMemcpyDeviceToHost);
+    jpeg_set_defaults(&cinfo);
+    jpeg_start_compress(&cinfo, TRUE);
 
-  
-  // compare CPU and GPU results
-  for (i = 0; i < degreeBins * rBins; i++)
-  {
-    if (cpuht[i] != h_hough[i])
-      printf ("Calculation mismatch at : %i %i %i\n", i, cpuht[i], h_hough[i]);
-  }
-  printf("Done!\n");
+    JSAMPROW row_pointer;
+    while (cinfo.next_scanline < cinfo.image_height) {
+        row_pointer = (JSAMPROW) &inImg.pixels[cinfo.next_scanline * w];
+        jpeg_write_scanlines(&cinfo, &row_pointer, 1);
+    }
 
-  // TODO clean-up
-  // Liberar memoria del host
-  free(cpuht);
-  free(pcCos);
-  free(pcSin);
-  free(h_hough);
+    jpeg_finish_compress(&cinfo);
+    fclose(outfile);
+    jpeg_destroy_compress(&cinfo);
 
-  // Liberar memoria del dispositivo
-  cudaFree(d_Cos);
-  cudaFree(d_Sin);
-  cudaFree(d_in);
-  cudaFree(d_hough);
+    free(cpuht);
+    free(h_hough);
+    cudaFree(d_in);
+    cudaFree(d_hough);
 
-  return 0;
+    return 0;
 }
