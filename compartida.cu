@@ -24,36 +24,35 @@ const int degreeInc = 2;
 const int degreeBins = 180 / degreeInc;
 const int rBins = 100;
 const float radInc = degreeInc * M_PI / 180;
-
 //*****************************************************************
-// The CPU function returns a pointer to the accumulator
-void CPU_HoughTran(unsigned char *pic, int w, int h, int **acc)
+// The CPU function returns a pointer to the accummulator
+void CPU_HoughTran (unsigned char *pic, int w, int h, int **acc)
 {
-    float rMax = sqrt(1.0 * w * w + 1.0 * h * h) / 2; //(w^2 + h^2)/2, radio max equivalente a centro -> esquina
-    *acc = new int[rBins * degreeBins];             //el acumulador, conteo de píxeles encontrados, 90*180/degInc = 9000
-    memset(*acc, 0, sizeof(int) * rBins * degreeBins); //init en ceros
-    int xCent = w / 2;
-    int yCent = h / 2;
-    float rScale = 2 * rMax / rBins;
+  float rMax = sqrt (1.0 * w * w + 1.0 * h * h) / 2;  //(w^2 + h^2)/2, radio max equivalente a centro -> esquina
+  *acc = new int[rBins * degreeBins];            //el acumulador, conteo depixeles encontrados, 90*180/degInc = 9000
+  memset (*acc, 0, sizeof (int) * rBins * degreeBins); //init en ceros
+  int xCent = w / 2;
+  int yCent = h / 2;
+  float rScale = 2 * rMax / rBins;
 
-    for (int i = 0; i < w; i++) //por cada píxel
-        for (int j = 0; j < h; j++) //...
-        {
-            int idx = j * w + i;
-            if (pic[idx] > 0) //si pasa thresh, entonces lo marca
-            {
-                int xCoord = i - xCent;
-                int yCoord = yCent - j; // y-coord tiene que invertirse
-                float theta = 0;        // ángulo actual
-                for (int tIdx = 0; tIdx < degreeBins; tIdx++) //agrega 1 a todas las líneas en ese píxel
-                {
-                    float r = xCoord * cos(theta) + yCoord * sin(theta);
-                    int rIdx = (r + rMax) / rScale;
-                    (*acc)[rIdx * degreeBins + tIdx]++; //+1 para este radio r y este theta
-                    theta += radInc;
-                }
-            }
-        }
+  for (int i = 0; i < w; i++) //por cada pixel
+    for (int j = 0; j < h; j++) //...
+      {
+        int idx = j * w + i;
+        if (pic[idx] > 0) //si pasa thresh, entonces lo marca
+          {
+            int xCoord = i - xCent;
+            int yCoord = yCent - j;  // y-coord has to be reversed
+            float theta = 0;         // actual angle
+            for (int tIdx = 0; tIdx < degreeBins; tIdx++) //add 1 to all lines in that pixel
+              {
+                float r = xCoord * cos (theta) + yCoord * sin (theta);
+                int rIdx = (r + rMax) / rScale;
+                (*acc)[rIdx * degreeBins + tIdx]++; //+1 para este radio r y este theta
+                theta += radInc;
+              }
+          }
+      }
 }
 
 //*****************************************************************
@@ -62,31 +61,27 @@ void CPU_HoughTran(unsigned char *pic, int w, int h, int **acc)
 __constant__ float d_Cos[degreeBins];
 __constant__ float d_Sin[degreeBins];
 
+
 // GPU kernel. One thread per image pixel is spawned.
-// The accumulator memory needs to be allocated by the host in global memory
-__global__ void GPU_HoughTran_Shared(unsigned char *pic, int w, int h, int *acc, float rMax, float rScale)
+// The accummulator memory needs to be allocated by the host in global memory
+__global__ void GPU_HoughTran(unsigned char *pic, int w, int h, int *acc, float rMax, float rScale)
 {
-    // TODO: calcular locID
+    int gloID = blockIdx.x * blockDim.x + threadIdx.x;
     int locID = threadIdx.x;
 
-    // TODO: definir un acumulador local en memoria compartida llamado localAcc
-    __shared__ int localAcc[degreeBins * rBins];
-
-    // TODO: inicializar a 0 todos los elementos de localAcc
-    localAcc[locID] = 0;
-
-    // TODO: barrera para garantizar que todos los hilos hayan completado la inicialización de localAcc
-    __syncthreads();
-
-    // TODO: calcular gloID
-    int gloID = blockIdx.x * blockDim.x + threadIdx.x;
     if (gloID >= w * h)
-        return; // en caso de hilos extra en el bloque
+        return;
+
+    __shared__ int localAcc[degreeBins * rBins];
+    for (int i = locID; i < degreeBins * rBins; i += blockDim.x)
+    {
+        localAcc[i] = 0;
+    }
+
+    __syncthreads();
 
     int xCent = w / 2;
     int yCent = h / 2;
-
-    // TODO: calcular xCoord y yCoord
     int xCoord = gloID % w - xCent;
     int yCoord = yCent - gloID / w;
 
@@ -94,22 +89,20 @@ __global__ void GPU_HoughTran_Shared(unsigned char *pic, int w, int h, int *acc,
     {
         for (int tIdx = 0; tIdx < degreeBins; tIdx++)
         {
-            // TODO: utilizar memoria constante para senos y cosenos
             float r = xCoord * d_Cos[tIdx] + yCoord * d_Sin[tIdx];
             int rIdx = (r + rMax) / rScale;
 
-            // TODO: usar una operación de suma atómica para actualizar localAcc
-            atomicAdd(&localAcc[tIdx * rBins + rIdx], 1);
+            if (rIdx >= 0 && rIdx < rBins)
+            {
+                atomicAdd(&localAcc[rIdx * degreeBins + tIdx], 1);
+            }
         }
     }
 
-    // TODO: barrera para garantizar que todos los hilos hayan completado el proceso de incremento de localAcc
     __syncthreads();
 
-    // TODO: agregar un loop que sume los valores de localAcc a acc
     for (int i = locID; i < degreeBins * rBins; i += blockDim.x)
     {
-        // TODO: usar una operación de suma atómica para actualizar acc
         atomicAdd(&acc[i], localAcc[i]);
     }
 }
@@ -135,14 +128,16 @@ void drawLine(unsigned char *img, int w, int h, float rScale, int x0, int y0, in
         {
             err += dy;
             x0 += sx;
-        }
+        } 
         if (e2 <= dx)
         {
             err += dx;
             y0 += sy;
-        }
+        } 
     }
 }
+
+
 
 void drawLines(unsigned char *img, int w, int h, int *acc, int threshold, float rScale)
 {
@@ -154,7 +149,7 @@ void drawLines(unsigned char *img, int w, int h, int *acc, int threshold, float 
             int idx = rIdx * degreeBins + tIdx;
             if (acc[idx] > threshold)
             {
-                float r = (rIdx - rBins / 2) * rScale; // Ajustar el valor de r
+                float r = (rIdx - rBins / 2) * rScale;  // Ajustar el valor de r
 
                 // Calcular las coordenadas de la línea
                 int x0, y0, x1, y1;
@@ -186,8 +181,8 @@ void drawLines(unsigned char *img, int w, int h, int *acc, int threshold, float 
     }
 }
 
-int main(int argc, char **argv)
-{
+
+int main(int argc, char **argv) {
     int i;
     PGMImage inImg(argv[1]);
     int w = inImg.x_dim;
@@ -203,14 +198,13 @@ int main(int argc, char **argv)
 
     float pcCos[degreeBins], pcSin[degreeBins];
     float rad = 0;
-    for (int i = 0; i < degreeBins; i++)
-    {
+    for (int i = 0; i < degreeBins; i++) {
         pcCos[i] = cos(rad);
         pcSin[i] = sin(rad);
         rad += radInc;
     }
 
-    float rMax = sqrt(1.0 * w * w + 1.0 * h * h) / 2;
+    float rMax = sqrt (1.0 * w * w + 1.0 * h * h) / 2;
     float rScale = 2 * rMax / rBins;
 
     cudaMemcpyToSymbol(d_Cos, pcCos, sizeof(float) * degreeBins);
@@ -226,7 +220,7 @@ int main(int argc, char **argv)
 
     int blockNum = ceil((w * h) / 256.0);
     cudaEventRecord(start);
-    GPU_HoughTran_Shared<<<blockNum, 256>>>(d_in, w, h, d_hough, rMax, rScale);
+    GPU_HoughTran<<<blockNum, 256>>>(d_in, w, h, d_hough, rMax, rScale);
 
     // Registro del final del evento
     cudaEventRecord(stop);
@@ -246,22 +240,23 @@ int main(int argc, char **argv)
     // Copiar resultados de vuelta al host y limpiar
     int *h_hough = (int *)malloc(sizeof(int) * degreeBins * rBins);
     cudaMemcpy(h_hough, d_hough, sizeof(int) * degreeBins * rBins, cudaMemcpyDeviceToHost);
-
+    
     // compare CPU and GPU results
     for (i = 0; i < degreeBins * rBins; i++)
     {
-        if (cpuht[i] != h_hough[i])
-            printf("Calculation mismatch at : %i %i %i\n", i, cpuht[i], h_hough[i]);
+      if (cpuht[i] != h_hough[i])
+        printf ("Calculation mismatch at : %i %i %i\n", i, cpuht[i], h_hough[i]);
     }
 
+   
+
     // Dibujar las líneas en la imagen
-    int threshold = 3000;
+    int threshold = 3000; 
     drawLines(inImg.pixels, w, h, h_hough, threshold, rScale);
 
     // Guardar la imagen resultante en formato JPEG
-    FILE *outfile = fopen("output.jpg", "wb");
-    if (!outfile)
-    {
+    FILE *outfile = fopen("output_compartida.jpg", "wb");
+    if (!outfile) {
         std::cerr << "No se pudo abrir output.jpg para escritura" << std::endl;
         return -1;
     }
@@ -281,9 +276,8 @@ int main(int argc, char **argv)
     jpeg_start_compress(&cinfo, TRUE);
 
     JSAMPROW row_pointer;
-    while (cinfo.next_scanline < cinfo.image_height)
-    {
-        row_pointer = (JSAMPROW)&inImg.pixels[cinfo.next_scanline * w];
+    while (cinfo.next_scanline < cinfo.image_height) {
+        row_pointer = (JSAMPROW) &inImg.pixels[cinfo.next_scanline * w];
         jpeg_write_scanlines(&cinfo, &row_pointer, 1);
     }
 

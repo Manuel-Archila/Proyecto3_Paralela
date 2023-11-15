@@ -245,7 +245,7 @@ int main(int argc, char **argv) {
     drawLines(inImg.pixels, w, h, h_hough, threshold, rScale);
 
     // Guardar la imagen resultante en formato JPEG
-    FILE *outfile = fopen("output.jpg", "wb");
+    FILE *outfile = fopen("output_constante.jpg", "wb");
     if (!outfile) {
         std::cerr << "No se pudo abrir output.jpg para escritura" << std::endl;
         return -1;
